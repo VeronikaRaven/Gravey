@@ -1,6 +1,6 @@
 # main.py
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import math
 import json
 from config import *
@@ -15,6 +15,12 @@ class SlopeCanvas(tk.Canvas):
         self.app = app
         self.points = []
         self.water_points = []
+
+        # НОВОЕ: Списки для внутренних фигур (включений)
+        self.inclusions = []  # Завершенные фигуры
+        self.current_inclusion = []  # Текущая рисуемая фигура
+        self.inclusion_mode = False  # Флаг режима рисования включений
+
         self.scale = DEFAULT_SCALE
         self.offset_x = 100
         self.offset_y = 500
@@ -23,9 +29,11 @@ class SlopeCanvas(tk.Canvas):
         self.drag_water_idx = None
         self.water_mode = False
         self.history = []
-        self.read_only = False  # НОВОЕ: Флаг "Только для чтения"
+        self.read_only = False
+        self.soil_color = "#ffffff"
 
         self.bind("<Button-1>", self.on_left_click)
+        self.bind("<Button-3>", self.on_right_click)
         self.bind("<B1-Motion>", self.on_left_drag)
         self.bind("<ButtonRelease-1>", self.on_release)
         self.bind("<Motion>", self.on_mouse_move)
@@ -41,11 +49,21 @@ class SlopeCanvas(tk.Canvas):
     def screen_to_model(self, sx, sy):
         return (sx - self.offset_x) / self.scale, (self.offset_y - sy) / self.scale
 
+    def is_point_in_poly(self, pt, polygon):
+        """Проверяет, находится ли точка внутри полигона"""
+        if not polygon: return False
+        x, y = pt
+        n = len(polygon)
+        inside = False
+        for i in range(n):
+            x1, y1 = polygon[i]
+            x2, y2 = polygon[(i + 1) % n]
+            if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1):
+                inside = not inside
+        return inside
+
     def save_state(self):
-        state = {
-            'points': self.points.copy(),
-            'water': self.water_points.copy()
-        }
+        state = {'points': self.points.copy(), 'water': self.water_points.copy()}
         self.history.append(state)
         if len(self.history) > 20: self.history.pop(0)
 
@@ -61,6 +79,8 @@ class SlopeCanvas(tk.Canvas):
         self.draw_grid()
         self.draw_axes()
         self.draw_slope()
+        self.draw_layers()
+        self.draw_inclusions()  # НОВОЕ: Рисуем внутренние фигуры
         self.draw_water()
 
     def draw_grid(self):
@@ -90,12 +110,58 @@ class SlopeCanvas(tk.Canvas):
         if len(self.points) > 1:
             screen_pts = [self.model_to_screen(x, y) for x, y in self.points]
             screen_pts.append(screen_pts[0])
-            self.create_polygon(screen_pts, outline=COLORS["slope"], fill="", width=2)
+            self.create_polygon(screen_pts, outline=COLORS["slope"], fill=self.soil_color, stipple="gray25", width=2)
 
         for i, (x, y) in enumerate(self.points):
             sx, sy = self.model_to_screen(x, y)
             self.create_oval(sx - 4, sy - 4, sx + 4, sy + 4, fill="red")
             self.create_text(sx + 10, sy - 10, text=str(i + 1), fill="red", font=("Arial", 8))
+
+    def draw_layers(self):
+        if len(self.points) < 3 or not self.app.layers: return
+        for layer in self.app.layers:
+            y_bot = layer['y_bottom']
+            y_top = layer['y_top']
+            color = layer['color']
+            left_pts, right_pts = [], []
+            x_coords = [p[0] for p in self.points]
+            xmin, xmax = min(x_coords), max(x_coords)
+
+            for i in range(100):
+                x = xmin + (xmax - xmin) * i / 99
+                y1, y2 = self.app.calculator.get_slope_height(x)
+                if y1 is not None and max(y1, y_bot) < min(y2, y_top):
+                    left_pts.append((x, max(y1, y_bot)))
+                    right_pts.append((x, min(y2, y_top)))
+
+            if len(left_pts) > 1:
+                poly_pts = []
+                for p in left_pts:
+                    poly_pts.extend(self.model_to_screen(p[0], p[1]))
+                for p in reversed(right_pts):
+                    poly_pts.extend(self.model_to_screen(p[0], p[1]))
+                if len(poly_pts) >= 6:
+                    self.create_polygon(poly_pts, fill=color, outline="", stipple="gray50")
+
+    def draw_inclusions(self):
+        """НОВОЕ: Рисует внутренние фигуры (бетон, линзы грунта и т.д.)"""
+        # Рисуем все готовые включения
+        for inc in self.inclusions:
+            if len(inc) > 2:
+                screen_pts = [self.model_to_screen(x, y) for x, y in inc]
+                self.create_polygon(screen_pts, outline="#555555", fill="#A9A9A9", stipple="gray50", width=2)
+
+        # Рисуем текущую фигуру, которую пользователь только что начал
+        if self.current_inclusion:
+            screen_pts = [self.model_to_screen(x, y) for x, y in self.current_inclusion]
+            # Линии
+            if len(screen_pts) > 1:
+                flat = [c for p in screen_pts for c in p]
+                self.create_line(flat, fill="orange", width=2, dash=(4, 2))
+            # Точки
+            for x, y in self.current_inclusion:
+                sx, sy = self.model_to_screen(x, y)
+                self.create_oval(sx - 3, sy - 3, sx + 3, sy + 3, fill="orange")
 
     def draw_water(self):
         if len(self.water_points) > 1:
@@ -138,11 +204,25 @@ class SlopeCanvas(tk.Canvas):
             self.create_line(screen_pts, fill=color, width=width, dash=dash, smooth=True)
 
     def on_left_click(self, event):
-        # НОВОЕ: Если вкладка только для чтения, игнорируем клики!
-        if self.read_only:
+        if self.read_only: return
+        mx, my = self.screen_to_model(event.x, event.y)
+
+        # НОВОЕ: Если мы в режиме рисования включения
+        if self.inclusion_mode:
+            # Проверяем, что кликнули ВНУТРИ откоса
+            if len(self.points) < 3:
+                messagebox.showwarning("Ошибка", "Сначала нарисуйте основной контур откоса!")
+                return
+
+            if self.is_point_in_poly((mx, my), self.points):
+                self.current_inclusion.append((mx, my))
+                self.draw()
+            else:
+                # Если кликнули снаружи — предупреждаем
+                self.app.info_label.config(text="Ошибка: Включение должно быть ВНУТРИ откоса!")
             return
 
-        mx, my = self.screen_to_model(event.x, event.y)
+        # Стандартный режим рисования точек контура
         for i, (px, py) in enumerate(self.points):
             if math.hypot(px - mx, py - my) * self.scale < 15:
                 self.drag_point_idx = i
@@ -161,10 +241,18 @@ class SlopeCanvas(tk.Canvas):
             self.points.append((mx, my))
         self.draw()
 
-    def on_left_drag(self, event):
-        if self.read_only:
-            return
+    def on_right_click(self, event):
+        if self.read_only: return
+        mx, my = self.screen_to_model(event.x, event.y)
+        for i, (px, py) in enumerate(self.points):
+            if math.hypot(px - mx, py - my) * self.scale < 15:
+                self.save_state()
+                del self.points[i]
+                self.draw()
+                return
 
+    def on_left_drag(self, event):
+        if self.read_only: return
         mx, my = self.screen_to_model(event.x, event.y)
         if self.drag_point_idx is not None:
             self.points[self.drag_point_idx] = (mx, my)
@@ -202,6 +290,8 @@ class App:
         self.root.title("Геотехнический калькулятор (Прототип)")
         self.root.geometry("1300x800")
 
+        self.layers = []
+
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
@@ -210,7 +300,6 @@ class App:
         self.create_filtration_tab()
         self.create_thermal_tab()
 
-        # НОВОЕ: Умный Ctrl+Z, который понимает, на какой мы вкладке
         self.root.bind_all("<Control-z>", self.global_undo)
 
     def global_undo(self, event=None):
@@ -241,7 +330,7 @@ class App:
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="1. Устойчивость откоса")
 
-        left_panel = ttk.Frame(tab, width=240)
+        left_panel = ttk.Frame(tab, width=260)
         left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
         left_panel.pack_propagate(False)
 
@@ -249,11 +338,18 @@ class App:
         tools_frame.pack(fill=tk.X, pady=5)
         ttk.Button(tools_frame, text="Очистить всё", command=self.clear_canvas).pack(fill=tk.X, pady=2)
         ttk.Button(tools_frame, text="Режим УГВ (Вода)", command=self.toggle_water_mode).pack(fill=tk.X, pady=2)
+
+        # НОВОЕ: Кнопки для рисования внутренних фигур
+        ttk.Button(tools_frame, text="Нарисовать включение (внутри)", command=self.toggle_inclusion_mode).pack(
+            fill=tk.X, pady=2)
+        ttk.Button(tools_frame, text="Завершить включение", command=self.finish_inclusion).pack(fill=tk.X, pady=2)
+
         ttk.Button(tools_frame, text="Сбросить масштаб", command=lambda: self.canvas.reset_scale()).pack(fill=tk.X,
                                                                                                          pady=2)
 
-        soil_frame = ttk.LabelFrame(left_panel, text="Свойства грунта", padding=5)
+        soil_frame = ttk.LabelFrame(left_panel, text="Свойства основного грунта", padding=5)
         soil_frame.pack(fill=tk.X, pady=5)
+
         ttk.Label(soil_frame, text="Удельный вес γ (кН/м³):").pack(anchor=tk.W)
         self.ent_gamma = ttk.Entry(soil_frame)
         self.ent_gamma.insert(0, "19.0")
@@ -269,6 +365,23 @@ class App:
         self.ent_phi.insert(0, "18.0")
         self.ent_phi.pack(fill=tk.X, pady=2)
 
+        self.soil_color_box = tk.Label(soil_frame, text="Суглинок", bg="#FFB3BA", font=("Arial", 9, "bold"))
+        self.soil_color_box.pack(fill=tk.X, pady=5)
+
+        self.ent_c.bind("<KeyRelease>", self.update_soil_color)
+        self.ent_phi.bind("<KeyRelease>", self.update_soil_color)
+
+        layer_frame = ttk.LabelFrame(left_panel, text="Доп. слои (Гравий и др.)", padding=5)
+        layer_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(layer_frame, text="+ Добавить слой", command=self.add_layer).pack(fill=tk.X, pady=2)
+
+        self.layer_listbox = tk.Listbox(layer_frame, height=4, font=("Arial", 9))
+        self.layer_listbox.pack(fill=tk.X, pady=5)
+
+        ttk.Button(layer_frame, text="Удалить выбранный слой", command=self.delete_selected_layer).pack(fill=tk.X,
+                                                                                                        pady=2)
+
         type_frame = ttk.LabelFrame(left_panel, text="Тип объекта", padding=5)
         type_frame.pack(fill=tk.X, pady=5)
         self.obj_type = tk.StringVar(value="permanent")
@@ -279,7 +392,7 @@ class App:
         ttk.Radiobutton(type_frame, text="Ответственный (1.50)", variable=self.obj_type, value="responsible").pack(
             anchor=tk.W)
 
-        ttk.Button(left_panel, text="РАССЧИТАТЬ FS", command=self.calculate_stability).pack(fill=tk.X, pady=15,
+        ttk.Button(left_panel, text="РАССЧИТАТЬ FS", command=self.calculate_stability).pack(fill=tk.X, pady=10,
                                                                                             ipady=10)
 
         right_panel = ttk.Frame(tab, width=260)
@@ -304,50 +417,101 @@ class App:
         self.info_label.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.calculator = SlopeCalculator([], [])
+        self.update_soil_color()
+
+    def toggle_inclusion_mode(self):
+        self.canvas.inclusion_mode = not self.canvas.inclusion_mode
+        if self.canvas.inclusion_mode:
+            messagebox.showinfo("Включение", "Режим включения ВКЛ. Кликайте внутри откоса, чтобы нарисовать фигуру.")
+        else:
+            messagebox.showinfo("Включение", "Режим включения ВЫКЛ.")
+
+    def finish_inclusion(self):
+        if len(self.canvas.current_inclusion) > 2:
+            self.canvas.inclusions.append(self.canvas.current_inclusion)
+            self.canvas.current_inclusion = []
+            self.canvas.inclusion_mode = False
+            self.canvas.draw()
+            messagebox.showinfo("Успех", "Включение добавлено!")
+        else:
+            messagebox.showwarning("Ошибка", "Слишком мало точек для фигуры (нужно минимум 3).")
+
+    def add_layer(self):
+        y_bot = simpledialog.askfloat("Слой", "Нижняя граница Y (м):", initialvalue=0.0)
+        if y_bot is None: return
+        y_top = simpledialog.askfloat("Слой", "Верхняя граница Y (м):", initialvalue=y_bot + 5.0)
+        if y_top is None: return
+
+        soil_names = list(SOIL_PRESETS.keys())
+        choice = simpledialog.askinteger("Слой", f"Выберите грунт для слоя (1-{len(soil_names)}):\n" + "\n".join(
+            f"{i + 1}. {name}" for i, name in enumerate(soil_names)), minvalue=1, maxvalue=len(soil_names))
+        if not choice: return
+
+        soil = SOIL_PRESETS[soil_names[choice - 1]]
+        self.layers.append({
+            'name': soil_names[choice - 1], 'y_bottom': min(y_bot, y_top), 'y_top': max(y_bot, y_top),
+            'gamma': soil['gamma'], 'c': soil['c'], 'phi': soil['phi'], 'color': soil['color']
+        })
+        self.update_layer_list()
+        self.canvas.draw()
+
+    def update_layer_list(self):
+        self.layer_listbox.delete(0, tk.END)
+        for i, l in enumerate(self.layers):
+            self.layer_listbox.insert(tk.END, f"{i + 1}. {l['name']} ({l['y_bottom']:.1f}-{l['y_top']:.1f}м)")
+
+    def delete_selected_layer(self):
+        selection = self.layer_listbox.curselection()
+        if not selection: return
+        index = selection[0]
+        del self.layers[index]
+        self.update_layer_list()
+        self.canvas.draw()
+
+    def update_soil_color(self, event=None):
+        try:
+            c_val = float(self.ent_c.get())
+            phi_val = float(self.ent_phi.get())
+            soil_name = get_soil_by_params(c_val, phi_val)
+            soil_color = SOIL_PRESETS[soil_name]["color"]
+
+            self.soil_color_box.config(text=f"Основной: {soil_name}", bg=soil_color)
+            self.canvas.soil_color = soil_color
+            self.canvas.draw()
+        except ValueError:
+            pass
 
     def create_filtration_tab(self):
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="2. Фильтрация")
-
         left_panel = ttk.Frame(tab, width=240)
         left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
-        left_panel.pack_propagate(False)
-
-        ttk.Button(left_panel, text="Скопировать контур из вкладки 1", command=self.copy_slope_geo).pack(fill=tk.X,
-                                                                                                         pady=5)
+        ttk.Button(left_panel, text="Скопировать контур", command=self.copy_slope_geo).pack(fill=tk.X, pady=5)
         ttk.Button(left_panel, text="РАССЧИТАТЬ ДЕПРЕССИЮ", command=self.calculate_filtration).pack(fill=tk.X, pady=15,
                                                                                                     ipady=10)
-
         self.filt_canvas = SlopeCanvas(tab, self)
-        self.filt_canvas.read_only = True  # НОВОЕ: Запрещаем клики!
+        self.filt_canvas.read_only = True
         self.filt_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
     def create_thermal_tab(self):
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="3. Промерзание/Оттаивание")
-
         left_panel = ttk.Frame(tab, width=240)
         left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
-        left_panel.pack_propagate(False)
-
-        ttk.Button(left_panel, text="Скопировать контур из вкладки 1", command=self.copy_slope_geo).pack(fill=tk.X,
-                                                                                                         pady=5)
+        ttk.Button(left_panel, text="Скопировать контур", command=self.copy_slope_geo).pack(fill=tk.X, pady=5)
 
         ttk.Label(left_panel, text="Температура воздуха (°C):").pack(anchor=tk.W, pady=(10, 0))
-        self.ent_t_air = ttk.Entry(left_panel)
-        self.ent_t_air.insert(0, "-20")
+        self.ent_t_air = ttk.Entry(left_panel);
+        self.ent_t_air.insert(0, "-20");
         self.ent_t_air.pack(fill=tk.X, pady=2)
-
         ttk.Label(left_panel, text="Длительность (суток):").pack(anchor=tk.W, pady=(10, 0))
-        self.ent_days = ttk.Entry(left_panel)
-        self.ent_days.insert(0, "30")
+        self.ent_days = ttk.Entry(left_panel);
+        self.ent_days.insert(0, "30");
         self.ent_days.pack(fill=tk.X, pady=2)
 
-        ttk.Button(left_panel, text="РАССЧИТАТЬ ПРОМЕРЗАНИЕ", command=self.calculate_thermal).pack(fill=tk.X, pady=15,
-                                                                                                   ipady=10)
-
+        ttk.Button(left_panel, text="РАССЧИТАТЬ", command=self.calculate_thermal).pack(fill=tk.X, pady=15, ipady=10)
         self.therm_canvas = SlopeCanvas(tab, self)
-        self.therm_canvas.read_only = True  # НОВОЕ: Запрещаем клики!
+        self.therm_canvas.read_only = True
         self.therm_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
     def copy_slope_geo(self):
@@ -355,8 +519,9 @@ class App:
         target_canvas = self.filt_canvas if current_tab == 1 else self.therm_canvas
         target_canvas.points = self.canvas.points.copy()
         target_canvas.water_points = self.canvas.water_points.copy()
+        target_canvas.inclusions = self.canvas.inclusions.copy()  # Передаем включения
+        target_canvas.soil_color = self.canvas.soil_color
         target_canvas.draw()
-        messagebox.showinfo("Успех", "Контур скопирован!")
 
     def calculate_filtration(self):
         if len(self.filt_canvas.points) < 3: return
@@ -369,11 +534,10 @@ class App:
     def calculate_thermal(self):
         if len(self.therm_canvas.points) < 3: return
         try:
-            t_air = float(self.ent_t_air.get())
+            t_air = float(self.ent_t_air.get());
             days = int(self.ent_days.get())
         except ValueError:
             return
-
         calc = ThermalCalculator(self.therm_canvas.points)
         curve = calc.solve(T_air=t_air, days=days)
         if curve:
@@ -383,6 +547,8 @@ class App:
     def clear_canvas(self):
         self.canvas.points = []
         self.canvas.water_points = []
+        self.canvas.inclusions = []
+        self.canvas.current_inclusion = []
         self.canvas.water_mode = False
         self.canvas.history = []
         self.canvas.draw()
@@ -394,14 +560,9 @@ class App:
         self.canvas.water_mode = not self.canvas.water_mode
         if self.canvas.water_mode:
             messagebox.showinfo("Режим УГВ", "Включен режим рисования УГВ.")
-        else:
-            messagebox.showinfo("Режим откоса", "Снова можно рисовать контур откоса.")
 
     def calculate_stability(self):
-        if len(self.canvas.points) < 3:
-            messagebox.showerror("Ошибка", "Нарисуйте контур откоса!")
-            return
-
+        if len(self.canvas.points) < 3: return
         try:
             soil_props = {
                 'gamma': float(self.ent_gamma.get()),
@@ -409,18 +570,13 @@ class App:
                 'phi': float(self.ent_phi.get())
             }
         except ValueError:
-            messagebox.showerror("Ошибка", "Проверьте ввод свойств грунта!")
             return
 
         self.calculator = SlopeCalculator(
-            points=self.canvas.points,
-            water_points=self.canvas.water_points,
-            obj_type=self.obj_type.get(),
-            soil_props=soil_props
+            points=self.canvas.points, water_points=self.canvas.water_points,
+            obj_type=self.obj_type.get(), layers=self.layers, soil_props=soil_props
         )
-
         circles = self.calculator.calculate_bishop(num_slices=30)
-
         if not circles: return
 
         best_fs, cx, cy, r = circles[0]
@@ -434,60 +590,46 @@ class App:
             self.result_status.config(text=f"НЕ УСТОЙЧИВО\n(Требуется ≥ {required_fs})", foreground="red")
 
         self.calc_info.config(text=f"Метод: Бишоп\nЦентр: ({cx:.1f}, {cy:.1f})\nR = {r:.1f} м")
-
         self.canvas.draw()
         self.canvas.draw_slip_arcs(circles)
 
     def save_project(self):
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json")],
-            title="Сохранить проект"
-        )
+        filename = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
         if not filename: return
-
         project_data = {
-            'points': self.canvas.points,
-            'water_points': self.canvas.water_points,
-            'gamma': self.ent_gamma.get(),
-            'c': self.ent_c.get(),
-            'phi': self.ent_phi.get(),
-            'obj_type': self.obj_type.get(),
-            't_air': self.ent_t_air.get(),
-            'days': self.ent_days.get()
+            'points': self.canvas.points, 'water_points': self.canvas.water_points,
+            'inclusions': self.canvas.inclusions, 'layers': self.layers,
+            'gamma': self.ent_gamma.get(), 'c': self.ent_c.get(), 'phi': self.ent_phi.get(),
+            'obj_type': self.obj_type.get(), 't_air': self.ent_t_air.get(), 'days': self.ent_days.get()
         }
-
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(project_data, f, ensure_ascii=False, indent=4)
-
+        with open(filename, 'w', encoding='utf-8') as f: json.dump(project_data, f, ensure_ascii=False, indent=4)
         messagebox.showinfo("Успех", "Проект сохранен!")
 
     def load_project(self):
-        filename = filedialog.askopenfilename(
-            filetypes=[("JSON files", "*.json")],
-            title="Загрузить проект"
-        )
+        filename = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
         if not filename: return
-
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
             self.canvas.points = [tuple(p) for p in data.get('points', [])]
             self.canvas.water_points = [tuple(p) for p in data.get('water_points', [])]
+            self.canvas.inclusions = [[tuple(p) for p in inc] for inc in data.get('inclusions', [])]
+            self.layers = data.get('layers', [])
 
-            self.ent_gamma.delete(0, tk.END)
+            self.ent_gamma.delete(0, tk.END);
             self.ent_gamma.insert(0, data.get('gamma', '19.0'))
-            self.ent_c.delete(0, tk.END)
+            self.ent_c.delete(0, tk.END);
             self.ent_c.insert(0, data.get('c', '15.0'))
-            self.ent_phi.delete(0, tk.END)
+            self.ent_phi.delete(0, tk.END);
             self.ent_phi.insert(0, data.get('phi', '18.0'))
             self.obj_type.set(data.get('obj_type', 'permanent'))
-            self.ent_t_air.delete(0, tk.END)
+            self.ent_t_air.delete(0, tk.END);
             self.ent_t_air.insert(0, data.get('t_air', '-20'))
-            self.ent_days.delete(0, tk.END)
+            self.ent_days.delete(0, tk.END);
             self.ent_days.insert(0, data.get('days', '30'))
 
+            self.update_layer_list();
+            self.update_soil_color();
             self.canvas.draw()
             messagebox.showinfo("Успех", "Проект загружен!")
         except Exception as e:
@@ -496,14 +638,15 @@ class App:
     def save_report(self):
         fs_text = self.result_fs.cget("text")
         if "FS = --" in fs_text: return
-
         filename = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
         if not filename: return
-
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("ОТЧЕТ О РАСЧЕТЕ УСТОЙЧИВОСТИ\n" + "=" * 30 + "\n")
             f.write(f"{fs_text}\n{self.result_status.cget('text')}\n")
-
+            f.write(f"Основной тип грунта: {self.soil_color_box.cget('text')}\n")
+            f.write("Дополнительные слои:\n")
+            for l in self.layers: f.write(f" - {l['name']} (Y: {l['y_bottom']}-{l['y_top']})\n")
+            if self.canvas.inclusions: f.write(f"Внутренних включений: {len(self.canvas.inclusions)}\n")
         messagebox.showinfo("Успех", "Отчет сохранен!")
 
 
