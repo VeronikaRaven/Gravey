@@ -1,6 +1,6 @@
 # calculator.py
 import math
-from config import SAFETY_FACTORS, DEFAULT_SOIL_TYPES
+from config import SAFETY_FACTORS, SOIL_PRESETS
 
 
 class SlopeCalculator:
@@ -14,7 +14,7 @@ class SlopeCalculator:
         if soil_props:
             self.default_soil = soil_props
         else:
-            self.default_soil = DEFAULT_SOIL_TYPES["Суглинок"]
+            self.default_soil = SOIL_PRESETS["Суглинок"].copy()
 
     def get_water_y(self, x):
         if not self.water_points: return -999.0
@@ -36,9 +36,8 @@ class SlopeCalculator:
             if layer['y_bottom'] <= y <= layer['y_top']:
                 return layer['gamma'], layer['c'], layer['phi']
 
-        # Если не попали в слой, берем первый
-        l = self.layers[0]
-        return l['gamma'], l['c'], l['phi']
+        # Вне дополнительных слоев остается основной грунт.
+        return self.default_soil['gamma'], self.default_soil['c'], self.default_soil['phi']
 
     def get_slope_height(self, x):
         intersections = []

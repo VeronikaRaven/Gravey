@@ -33,3 +33,23 @@ DEFAULT_SOIL_TYPES = {
     "Суглинок": {"gamma": 19.0, "c_dry": 15.0, "c_wet": 8.0, "phi": 18.0},
     "Глина": {"gamma": 20.0, "c_dry": 25.0, "c_wet": 15.0, "phi": 12.0}
 }
+
+# Единый формат свойств для интерфейса, слоев и расчета устойчивости.
+SOIL_PRESETS = {
+    name: {
+        "gamma": soil["gamma"],
+        "c": soil["c_dry"],
+        "phi": soil["phi"],
+        "color": COLORS["layer_fill"][index],
+    }
+    for index, (name, soil) in enumerate(DEFAULT_SOIL_TYPES.items())
+}
+
+
+def get_soil_by_params(c, phi):
+    """Выбирает ближайший образец только для подписи и цвета грунта."""
+    return min(
+        SOIL_PRESETS,
+        key=lambda name: (SOIL_PRESETS[name]["c"] - c) ** 2
+        + (SOIL_PRESETS[name]["phi"] - phi) ** 2,
+    )

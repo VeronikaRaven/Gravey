@@ -40,6 +40,7 @@ class SlopeCanvas(tk.Canvas):
         self.bind("<MouseWheel>", self.on_zoom)
         self.bind("<Button-4>", self.on_zoom)
         self.bind("<Button-5>", self.on_zoom)
+        self.bind("<Configure>", lambda event: self.draw())
 
         self.draw()
 
@@ -90,11 +91,11 @@ class SlopeCanvas(tk.Canvas):
         if step < 10: step *= 5
 
         start_x = self.offset_x % step
-        for x in range(int(start_x), w, int(step)):
+        for x in range(int(start_x), w, max(1, int(step))):
             self.create_line(x, 0, x, h, fill=COLORS["grid"])
 
         start_y = self.offset_y % step
-        for y in range(int(start_y), h, int(step)):
+        for y in range(int(start_y), h, max(1, int(step))):
             self.create_line(0, y, w, y, fill=COLORS["grid"])
 
     def draw_axes(self):
@@ -119,6 +120,7 @@ class SlopeCanvas(tk.Canvas):
 
     def draw_layers(self):
         if len(self.points) < 3 or not self.app.layers: return
+        geometry = SlopeCalculator(self.points, self.water_points)
         for layer in self.app.layers:
             y_bot = layer['y_bottom']
             y_top = layer['y_top']
@@ -129,7 +131,7 @@ class SlopeCanvas(tk.Canvas):
 
             for i in range(100):
                 x = xmin + (xmax - xmin) * i / 99
-                y1, y2 = self.app.calculator.get_slope_height(x)
+                y1, y2 = geometry.get_slope_height(x)
                 if y1 is not None and max(y1, y_bot) < min(y2, y_top):
                     left_pts.append((x, max(y1, y_bot)))
                     right_pts.append((x, min(y2, y_top)))
@@ -276,7 +278,7 @@ class SlopeCanvas(tk.Canvas):
             factor = 0.9
         else:
             return
-        self.scale *= factor
+        self.scale = min(200.0, max(2.0, self.scale * factor))
         self.draw()
 
     def reset_scale(self):
@@ -550,6 +552,9 @@ class App:
         self.canvas.inclusions = []
         self.canvas.current_inclusion = []
         self.canvas.water_mode = False
+        self.canvas.inclusion_mode = False
+        self.canvas.drag_point_idx = None
+        self.canvas.drag_water_idx = None
         self.canvas.history = []
         self.canvas.draw()
         self.result_fs.config(text="FS = --", foreground="gray")
